@@ -6,6 +6,8 @@ import { motion, AnimatePresence } from "framer-motion";
 // Single-file React app (Tailwind + Framer Motion)
 // Web3-hardened + Save Slots + Offer Types + Chargebacks/Refunds
 // Bills/Debt, Real-world Issues, Save Slots, Self-Tests
+// + Variable Interest, Quarterly Taxes, Vendor Negotiations, Staff Hires
+// + Auto-Advance Days
 // ==========================
 
 // --- Utility Helpers ---
@@ -33,7 +35,7 @@ const deepMerge = (base, patch) => {
 };
 
 // --- LocalStorage Keys for Save Slots ---
-const LS_SLOTS = "affiliateSimSlotsV3"; // { slots: {id: {name, savedAt, state}}, currentId }
+const LS_SLOTS = "affiliateSimSlotsV4"; // { slots: {id: {name, savedAt, state}}, currentId }
 const DEFAULT_SLOT_ID = "slot-1";
 
 const loadSlots = () => {
@@ -73,6 +75,7 @@ const START_STATE = {
   traffic: { seo: 1, shortform: 1, longform: 1, ads: 1, email: 1, social: 1 },
   multipliers: { revenue: 1, audience: 1, email: 1, rep: 1, energy: 1 },
   inventory: [], // purchased tools/upgrades
+  staff: [], // hired roles
   streak: 0,
   wheelCooldown: 0,
   log: [ { t: now(), kind: "info", text: "Welcome! Build your affiliate empire one day at a time." } ],
@@ -82,23 +85,28 @@ const START_STATE = {
     { id: "g3", text: "Build an email list of 500", done: false },
   ],
   achievements: [],
-  // NEW: Bills & Real-life timers
+  // Bills & Real-life timers
   bills: {
-    weekly: [
-      { id: "subs", name: "Tool Subscriptions", amount: 120 },
-    ],
-    monthly: [
-      { id: "office", name: "Home Office & Utilities", amount: 600 },
-      { id: "tax", name: "Estimated Taxes", amount: 200 },
-    ],
+    weekly: [ { id: "subs", name: "Tool Subscriptions", amount: 120 } ],
+    monthly: [ { id: "office", name: "Home Office & Utilities", amount: 600 }, { id: "tax_est", name: "Estimated Taxes", amount: 200 } ],
     nextWeekly: 7,
     nextMonthly: 30,
     lateFeesPaid: 0,
   },
-  modifiers: {
-    adsPenaltyDays: 0, // policy update hurts ads ROI
-    energyCapPenaltyDays: 0, // equipment issues reduce energy effectiveness
+  // Finance (APR, payroll, quarter tracking)
+  finance: {
+    apr: 0.18, // 18% variable APR on debt
+    daysToQuarter: 90,
+    quarterRevenue: 0, // tracked from actions/offers
+    payrollWeekly: 0, // sum of staff salaries
   },
+  modifiers: {
+    adsPenaltyDays: 0,
+    energyCapPenaltyDays: 0,
+    vendorDiscountDays: 0,
+    vendorDiscountRate: 0, // 0.1 = 10% off weekly vendor bills
+  },
+  settings: { autoDay: true, autoMs: 6000 },
 };
 
 // Event Cards (good + bad)
@@ -109,11 +117,11 @@ const EVENT_DECK = [
   { id: "algo_dip", title: "Algorithm Dip", desc: "Traffic tanks temporarily. Oof.",
     effect: (s) => ({ audience: Math.max(0, Math.floor(s.audience * 0.92)), reputation: Math.max(0, s.reputation - 4) }), weight: 1.1 },
   { id: "sponsor_ping", title: "Brand Reaches Out", desc: "Sponsored slot for your next video.",
-    effect: (s) => ({ cash: s.cash + Math.floor(rand(150, 450) * s.multipliers.revenue) }), weight: 0.8 },
+    effect: (s) => ({ cash: s.cash + Math.floor(rand(150, 450) * s.multipliers.revenue), finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + Math.floor(rand(150, 450)) } }), weight: 0.8 },
   { id: "ad_account_flag", title: "Ad Account Flagged", desc: "Compliance hiccup—pay a review fee.",
     effect: (s) => ({ cash: Math.max(0, s.cash - 250), reputation: Math.max(0, s.reputation - 6) }), weight: 0.6 },
   { id: "testimonial_wave", title: "Wave of Testimonials", desc: "+rep and conversions",
-    effect: (s) => ({ reputation: s.reputation + 10, conversions: s.conversions + 25, cash: s.cash + 25 * 29 }), weight: 0.7 },
+    effect: (s) => ({ reputation: s.reputation + 10, conversions: s.conversions + 25, cash: s.cash + 25 * 29, finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + 25 * 29 } }), weight: 0.7 },
   { id: "platform_outage", title: "Platform Outage", desc: "Your scheduler fails. Missed posts.",
     effect: (s) => ({ audience: Math.max(0, s.audience - 120), reputation: Math.max(0, s.reputation - 3) }), weight: 0.7 },
   { id: "seo_win", title: "SEO Win", desc: "Evergreen guide hits page one.",
@@ -123,14 +131,14 @@ const EVENT_DECK = [
     effect: (s) => ({ cash: Math.max(0, Math.floor(s.cash * 0.9)), reputation: Math.max(0, s.reputation - 2) }), weight: 0.6 },
   { id: "chargeback_storm", title: "Chargeback Storm", desc: "Banks claw back disputed payments; subscription churn spikes.",
     effect: (s) => ({ cash: Math.max(0, s.cash - 200), mrr: Math.max(0, Math.floor(s.mrr * 0.9)), reputation: Math.max(0, s.reputation - 6) }), weight: 0.4 },
-  // NEW: Real-life business issues
+  // Real-life business issues
   { id: "equipment_break", title: "Camera/PC Breakdown", desc: "Unexpected repair bill.",
     effect: (s) => { const insured = s.inventory?.includes("business_insurance"); const base = Math.floor(rand(150, 400)); const cost = insured ? Math.floor(base * 0.5) : base; return { cash: Math.max(0, s.cash - cost), modifiers: { ...s.modifiers, energyCapPenaltyDays: s.modifiers.energyCapPenaltyDays + 1 } }; }, weight: 0.7 },
   { id: "policy_update", title: "Platform Policy Update", desc: "Ad performance down for a bit.",
     effect: (s) => ({ modifiers: { ...s.modifiers, adsPenaltyDays: s.modifiers.adsPenaltyDays + 3 } }), weight: 0.7 },
 ];
 
-// Shop Items (upgrades/tools)
+// Shop Items (upgrades/tools & hires)
 const SHOP = [
   { id: "repurpose", name: "Content Repurposer", desc: "Multiply content reach across platforms.", cost: 350, apply: (s) => ({ multipliers: { ...s.multipliers, audience: s.multipliers.audience * 1.2 } }) },
   { id: "opus", name: "Auto Clip Editor", desc: "Faster editing, more posts.", cost: 300, apply: (s) => ({ multipliers: { ...s.multipliers, audience: s.multipliers.audience * 1.15 } }) },
@@ -141,6 +149,10 @@ const SHOP = [
   { id: "legal_shield", name: "Dispute Shield", desc: "Reduce refund & chargeback impact by 30%.", cost: 480, apply: (s) => ({ inventory: [...s.inventory, "legal_shield"] }) },
   { id: "bookkeeper", name: "Bookkeeper App", desc: "Cut late fees by 50% and show bill schedule.", cost: 260, apply: (s) => ({ inventory: [...s.inventory, "bookkeeper"] }) },
   { id: "business_insurance", name: "Business Insurance", desc: "Halves equipment breakdown costs.", cost: 380, apply: (s) => ({ inventory: [...s.inventory, "business_insurance"] }) },
+  // Staff hires (weekly payroll + productivity)
+  { id: "hire_va", name: "Hire VA (Part-time)", desc: "+10% energy efficiency; $150/wk payroll.", cost: 400, apply: (s) => ({ multipliers: { ...s.multipliers, energy: s.multipliers.energy * 1.1 }, staff: [...s.staff, { id: 'va', name: 'Virtual Assistant', weekly: 150 }], bills: { ...s.bills, weekly: [...s.bills.weekly, { id: 'pay_va', name: 'Payroll: VA', amount: 150 }] }, finance: { ...s.finance, payrollWeekly: s.finance.payrollWeekly + 150 } }) },
+  { id: "hire_editor", name: "Hire Video Editor", desc: "+15% audience growth; $300/wk payroll.", cost: 700, apply: (s) => ({ multipliers: { ...s.multipliers, audience: s.multipliers.audience * 1.15 }, staff: [...s.staff, { id: 'editor', name: 'Video Editor', weekly: 300 }], bills: { ...s.bills, weekly: [...s.bills.weekly, { id: 'pay_editor', name: 'Payroll: Editor', amount: 300 }] }, finance: { ...s.finance, payrollWeekly: s.finance.payrollWeekly + 300 } }) },
+  { id: "hire_buyer", name: "Hire Media Buyer", desc: "+12% revenue; $250/wk payroll.", cost: 600, apply: (s) => ({ multipliers: { ...s.multipliers, revenue: s.multipliers.revenue * 1.12 }, staff: [...s.staff, { id: 'buyer', name: 'Media Buyer', weekly: 250 }], bills: { ...s.bills, weekly: [...s.bills.weekly, { id: 'pay_buyer', name: 'Payroll: Media Buyer', amount: 250 }] }, finance: { ...s.finance, payrollWeekly: s.finance.payrollWeekly + 250 } }) },
 ];
 
 // Achievements
@@ -197,7 +209,8 @@ const ACTIONS = [
       const emails = Math.floor(baseAud * 0.08 * s.multipliers.email);
       const convs = Math.floor(baseAud * 0.018 + rand(0, 4));
       const rev = revenueFromOffers(s, { audienceDelta: baseAud, emailsDelta: emails, conversions: convs, channel: "shortform" });
-      return { audience: s.audience + baseAud, emailList: s.emailList + emails, conversions: s.conversions + convs, cash: s.cash + rev.cashDelta, mrr: s.mrr + rev.mrrDelta, reputation: s.reputation + 2, actionCounts: { ...s.actionCounts, shortform: n + 1 } };
+      const cashGain = rev.cashDelta;
+      return { audience: s.audience + baseAud, emailList: s.emailList + emails, conversions: s.conversions + convs, cash: s.cash + cashGain, mrr: s.mrr + rev.mrrDelta, reputation: s.reputation + 2, actionCounts: { ...s.actionCounts, shortform: n + 1 }, finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + Math.max(0, cashGain) } };
     },
   },
   {
@@ -211,7 +224,8 @@ const ACTIONS = [
       const emails = Math.floor(baseAud * 0.12 * s.multipliers.email);
       const convs = Math.floor(baseAud * 0.012 + rand(0, 3));
       const rev = revenueFromOffers(s, { audienceDelta: baseAud, emailsDelta: emails, conversions: convs, channel: "longform" });
-      return { audience: s.audience + baseAud, emailList: s.emailList + emails, reputation: s.reputation + rep, mrr: s.mrr + rev.mrrDelta + Math.floor(rand(5, 15)), cash: s.cash + rev.cashDelta, actionCounts: { ...s.actionCounts, longform: n + 1 } };
+      const upfront = Math.floor(rand(5, 15));
+      return { audience: s.audience + baseAud, emailList: s.emailList + emails, reputation: s.reputation + rep, mrr: s.mrr + rev.mrrDelta + upfront, cash: s.cash + rev.cashDelta, actionCounts: { ...s.actionCounts, longform: n + 1 }, finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + Math.max(0, rev.cashDelta) } };
     },
   },
   {
@@ -222,7 +236,8 @@ const ACTIONS = [
       const fatigue = Math.max(0.6, 1 - 0.08 * n);
       const baseAud = Math.floor(rand(40, 90) * s.traffic.seo * s.multipliers.audience * fatigue);
       const rev = revenueFromOffers(s, { audienceDelta: baseAud, emailsDelta: 0, conversions: Math.floor(baseAud * 0.008), channel: "blog" });
-      return { audience: s.audience + baseAud, mrr: s.mrr + rev.mrrDelta + Math.floor(rand(10, 25)), reputation: s.reputation + 3, cash: s.cash + rev.cashDelta, actionCounts: { ...s.actionCounts, blog: n + 1 } };
+      const upfront = Math.floor(rand(10, 25));
+      return { audience: s.audience + baseAud, mrr: s.mrr + rev.mrrDelta + upfront, reputation: s.reputation + 3, cash: s.cash + rev.cashDelta, actionCounts: { ...s.actionCounts, blog: n + 1 }, finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + Math.max(0, rev.cashDelta) } };
     },
   },
   {
@@ -236,7 +251,8 @@ const ACTIONS = [
       const subs = Math.floor(spend * 0.2 * s.multipliers.email);
       const aud = Math.floor(spend * 0.6 * s.multipliers.audience);
       const rev = revenueFromOffers(s, { audienceDelta: aud, emailsDelta: subs, conversions: Math.floor(aud * 0.01), channel: "ads" });
-      return { cash: Math.max(0, s.cash - spend + revenueRaw + rev.cashDelta), emailList: s.emailList + subs, audience: s.audience + aud, mrr: s.mrr + rev.mrrDelta };
+      const cashGain = -spend + revenueRaw + rev.cashDelta;
+      return { cash: Math.max(0, s.cash + cashGain), emailList: s.emailList + subs, audience: s.audience + aud, mrr: s.mrr + rev.mrrDelta, finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + Math.max(0, cashGain) } };
     },
   },
   {
@@ -246,35 +262,22 @@ const ACTIONS = [
       const base = s.emailList * (0.01 + s.reputation / 1000);
       const convs = Math.floor(base * rand(0.8, 1.6));
       const rev = revenueFromOffers(s, { audienceDelta: 0, emailsDelta: s.emailList, conversions: convs, channel: "email" });
-      return { conversions: s.conversions + convs, cash: s.cash + rev.cashDelta, mrr: s.mrr + rev.mrrDelta, reputation: s.reputation + 2 };
+      return { conversions: s.conversions + convs, cash: s.cash + rev.cashDelta, mrr: s.mrr + rev.mrrDelta, reputation: s.reputation + 2, finance: { ...s.finance, quarterRevenue: s.finance.quarterRevenue + Math.max(0, rev.cashDelta) } };
     },
   },
-  {
-    id: "optimize", label: "Optimize Funnel", cost: 20,
-    help: "Increase conversion rates across board.",
-    effect: (s) => ({ traffic: { ...s.traffic, ads: s.traffic.ads * 1.05 }, multipliers: { ...s.multipliers, revenue: s.multipliers.revenue * 1.05 }, reputation: s.reputation + 1 }),
-  },
-  {
-    id: "network", label: "Network / Partnerships", cost: 10,
-    help: "Collabs boost reach and reputation.",
-    effect: (s) => ({ reputation: s.reputation + 4, audience: s.audience + Math.floor(rand(40, 120) * s.multipliers.audience) }),
-  },
-  // NEW: Financial management
-  {
-    id: "pay_debt", label: "Pay Down Debt", cost: 5,
-    help: "Use cash to reduce any outstanding debt (min $50 per action).",
-    effect: (s) => {
-      if (s.debt <= 0 || s.cash <= 0) return { };
-      const pay = Math.min(s.cash, Math.max(50, Math.floor(s.debt * 0.25)));
-      return { cash: s.cash - pay, debt: Math.max(0, s.debt - pay) };
-    },
-  },
+  { id: "optimize", label: "Optimize Funnel", cost: 20, help: "Increase conversion rates across board.", effect: (s) => ({ traffic: { ...s.traffic, ads: s.traffic.ads * 1.05 }, multipliers: { ...s.multipliers, revenue: s.multipliers.revenue * 1.05 }, reputation: s.reputation + 1 }) },
+  { id: "network", label: "Network / Partnerships", cost: 10, help: "Collabs boost reach and reputation.", effect: (s) => ({ reputation: s.reputation + 4, audience: s.audience + Math.floor(rand(40, 120) * s.multipliers.audience) }) },
+  // Financial management
+  { id: "pay_debt", label: "Pay Down Debt", cost: 5, help: "Use cash to reduce any outstanding debt (min $50 per action).", effect: (s) => { if (s.debt <= 0 || s.cash <= 0) return {}; const pay = Math.min(s.cash, Math.max(50, Math.floor(s.debt * 0.25))); return { cash: s.cash - pay, debt: Math.max(0, s.debt - pay) }; } },
+  // Negotiations
+  { id: "negotiate_vendor", label: "Negotiate Vendor Contracts", cost: 10, help: "Chance to reduce weekly subscriptions for ~14 days.", effect: (s) => { if (s.modifiers.vendorDiscountDays > 0) return {}; const success = Math.random() < 0.55; if (!success) return { reputation: Math.max(0, s.reputation - 1) }; const rate = rand(0.1, 0.3); return { modifiers: { ...s.modifiers, vendorDiscountDays: 14, vendorDiscountRate: rate }, reputation: s.reputation + 2 }; } },
+  { id: "refinance", label: "Refinance Debt", cost: 10, help: "Attempt to lower APR by 2–5% (success depends on reputation).", effect: (s) => { const chance = clamp(0.25 + s.reputation / 150, 0.25, 0.85); if (Math.random() > chance) return { reputation: Math.max(0, s.reputation - 1) }; const cut = rand(0.02, 0.05); return { finance: { ...s.finance, apr: Math.max(0.05, s.finance.apr - cut) }, reputation: s.reputation + 1 }; } },
 ];
 
 // --- Pure calculators ---
 const dailyPassiveFromMRR = (mrr, revenueMult = 1) => Math.floor(mrr / 30) * revenueMult;
 
-// NEW: Bill processing (pure)
+// Bill processing + quarterly tax + vendor discounts
 function processBills(prev) {
   let next = { ...prev };
   let logs = [];
@@ -284,6 +287,14 @@ function processBills(prev) {
   // tick timers
   next.bills.nextWeekly -= 1;
   next.bills.nextMonthly -= 1;
+  next.finance.daysToQuarter -= 1;
+
+  const discountedWeekly = next.bills.weekly.map((it) => {
+    if (next.modifiers.vendorDiscountDays > 0 && it.id === "subs") {
+      return { ...it, amount: Math.floor(it.amount * (1 - next.modifiers.vendorDiscountRate)) };
+    }
+    return it;
+  });
 
   const pay = (label, items) => {
     const dueAmount = items.reduce((sum, it) => sum + it.amount, 0);
@@ -304,12 +315,22 @@ function processBills(prev) {
   };
 
   if (next.bills.nextWeekly <= 0) {
-    pay("Weekly bills", next.bills.weekly);
+    pay("Weekly bills", discountedWeekly);
     next.bills.nextWeekly = 7;
   }
   if (next.bills.nextMonthly <= 0) {
     pay("Monthly bills", next.bills.monthly);
     next.bills.nextMonthly = 30;
+  }
+
+  if (next.finance.daysToQuarter <= 0) {
+    const tax = Math.max(200, Math.floor(next.finance.quarterRevenue * 0.12));
+    if (tax > 0) {
+      if (next.cash >= tax) { next.cash -= tax; logs.push(`Quarterly taxes paid: -$${fmt(tax)}`); }
+      else { const unpaid = tax - next.cash; next.cash = 0; const late = Math.max(50, Math.floor(unpaid * 0.1 * lfMult)); next.debt += unpaid + late; next.reputation = Math.max(0, next.reputation - 4); next.bills.lateFeesPaid += late; logs.push(`Quarterly taxes missed: +$${fmt(unpaid + late)} to debt`); }
+    }
+    next.finance.quarterRevenue = 0;
+    next.finance.daysToQuarter = 90;
   }
 
   return { next, logs };
@@ -319,6 +340,14 @@ function computeEndOfDay(prev) {
   const passive = dailyPassiveFromMRR(prev.mrr, prev.multipliers.revenue);
   let next = { ...prev };
   next.cash = Math.floor(next.cash + passive);
+
+  // daily interest on debt
+  if (next.debt > 0) {
+    const dailyRate = next.finance.apr / 365;
+    const interest = Math.floor(next.debt * dailyRate);
+    next.debt += interest;
+  }
+
   // energy cap penalty reduces effective energy the next day
   const energyCap = next.modifiers.energyCapPenaltyDays > 0 ? 80 : 100;
   next.energy = energyCap;
@@ -350,6 +379,7 @@ function computeEndOfDay(prev) {
     ...next.modifiers,
     adsPenaltyDays: Math.max(0, next.modifiers.adsPenaltyDays - 1),
     energyCapPenaltyDays: Math.max(0, next.modifiers.energyCapPenaltyDays - 1),
+    vendorDiscountDays: Math.max(0, next.modifiers.vendorDiscountDays - 1),
   };
 
   // Update goals & achievements
@@ -379,8 +409,8 @@ function applyAction(prev, action) {
 
 function applyWheel(prev) {
   const slices = [
-    { label: "+$250", apply: (x) => ({ cash: x.cash + 250 }) },
-    { label: "+$500", apply: (x) => ({ cash: x.cash + 500 }) },
+    { label: "+$250", apply: (x) => ({ cash: x.cash + 250, finance: { ...x.finance, quarterRevenue: x.finance.quarterRevenue + 250 } }) },
+    { label: "+$500", apply: (x) => ({ cash: x.cash + 500, finance: { ...x.finance, quarterRevenue: x.finance.quarterRevenue + 500 } }) },
     { label: "+150 Audience", apply: (x) => ({ audience: x.audience + 150 }) },
     { label: "+100 Emails", apply: (x) => ({ emailList: x.emailList + 100 }) },
     { label: "+10 Rep", apply: (x) => ({ reputation: x.reputation + 10 }) },
@@ -532,10 +562,15 @@ function runSelfTests() {
   const revProbe = revenueFromOffers(START_STATE, { audienceDelta: 200, emailsDelta: 100, conversions: 10 });
   assert("offer engine returns numbers", typeof revProbe.cashDelta === "number" && typeof revProbe.mrrDelta === "number");
 
-  // NEW: bills processing
+  // bills processing
   let probe = { ...START_STATE, cash: 1000, bills: { ...START_STATE.bills, nextWeekly: 1, weekly: [{ id: 't', name: 'Test', amount: 100 }] } };
   const billRes = processBills(probe);
   assert("weekly bill consumes cash or creates debt", (billRes.next.cash === 900) || (billRes.next.debt > 0));
+
+  // interest accrual
+  const i0 = { ...START_STATE, debt: 1000 };
+  const i1 = computeEndOfDay(i0).next;
+  assert("interest adds to debt", i1.debt > 1000);
 
   return results;
 }
@@ -619,7 +654,7 @@ function GameInner() {
 
   // Persist
   useEffect(() => {
-    try { localStorage.setItem("affiliateSimV1", JSON.stringify(state)); } catch {}
+    try { localStorage.setItem("affiliateSimV2", JSON.stringify(state)); } catch {}
     const snapshot = loadSlots();
     if (!snapshot.slots[currentSlotId]) {
       snapshot.slots[currentSlotId] = { name: currentSlotId, savedAt: now(), state };
@@ -649,6 +684,16 @@ function GameInner() {
       window.removeEventListener("unhandledrejection", swallow, true);
     };
   }, []);
+
+  // Auto-advance days
+  useEffect(() => {
+    if (!state.settings?.autoDay) return;
+    const id = setInterval(() => {
+      setState((prev) => computeEndOfDay(prev).next);
+    }, clamp(state.settings.autoMs || 6000, 2000, 20000));
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.settings?.autoDay, state.settings?.autoMs]);
 
   const dailyPassive = useMemo(() => Math.floor(state.mrr / 30), [state.mrr]);
 
@@ -726,14 +771,15 @@ function GameInner() {
         </div>
 
         {/* Top Stats */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3 mb-6">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-8 gap-3 mb-6">
           <Stat label="Day" value={fmt(state.day)} />
           <Stat label="Cash" value={`$${fmt(state.cash)}`} sub={`Passive +$${fmt(dailyPassive * state.multipliers.revenue)}/day`} />
-          <Stat label="Debt" value={`$${fmt(state.debt)}`} sub={state.debt > 0 ? "Use Pay Down Debt" : "Clean"} />
+          <Stat label="Debt" value={`$${fmt(state.debt)}`} sub={`APR ${(state.finance.apr*100).toFixed(1)}%`} />
           <Stat label="Audience" value={fmt(state.audience)} />
           <Stat label="Email List" value={fmt(state.emailList)} />
           <Stat label="Reputation" value={fmt(state.reputation)} />
           <Stat label="MRR" value={`$${fmt(state.mrr)}`} />
+          <Stat label="Quarter" value={`${state.finance.daysToQuarter}d`} sub={`Q Rev: $${fmt(state.finance.quarterRevenue)}`} />
         </div>
 
         {/* Meters & Actions */}
@@ -743,7 +789,12 @@ function GameInner() {
             <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="text-lg font-semibold">Actions (Space toggles Shop, Enter ends day)</h2>
-                <Pill>Energy Left: {Math.round(state.energy)}</Pill>
+                <div className="flex items-center gap-2">
+                  <Pill>Energy Left: {Math.round(state.energy)}</Pill>
+                  <GhostButton onClick={() => setState((s) => ({ ...s, settings: { ...s.settings, autoDay: !s.settings.autoDay } }))}>{state.settings.autoDay ? "Auto: On" : "Auto: Off"}</GhostButton>
+                  <GhostButton onClick={() => setState((s) => ({ ...s, settings: { ...s.settings, autoMs: clamp((s.settings.autoMs||6000) - 2000, 2000, 20000) } }))}>Faster</GhostButton>
+                  <GhostButton onClick={() => setState((s) => ({ ...s, settings: { ...s.settings, autoMs: clamp((s.settings.autoMs||6000) + 2000, 2000, 20000) } }))}>Slower</GhostButton>
+                </div>
               </div>
               <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3">
                 {ACTIONS.map((a) => (
@@ -797,18 +848,21 @@ function GameInner() {
                 <Pill>Debt: ${fmt(state.debt)}</Pill>
               </div>
               <ul className="text-sm text-neutral-300 space-y-1">
-                <li>Weekly total: ${fmt(weeklyTotal)} — due in {state.bills.nextWeekly} day(s)</li>
+                <li>Weekly total: ${fmt(weeklyTotal)} {state.modifiers.vendorDiscountDays>0 && <span className="text-emerald-300">(negotiated -{Math.round(state.modifiers.vendorDiscountRate*100)}%)</span>} — due in {state.bills.nextWeekly} day(s)</li>
                 <li>Monthly total: ${fmt(monthlyTotal)} — due in {state.bills.nextMonthly} day(s)</li>
-                <li>Late fees paid so far: ${fmt(state.bills.lateFeesPaid)}</li>
+                <li>Quarter in {state.finance.daysToQuarter} day(s) • Q Rev: ${fmt(state.finance.quarterRevenue)}</li>
+                <li>APR: {(state.finance.apr*100).toFixed(1)}% • Late fees paid: ${fmt(state.bills.lateFeesPaid)}</li>
               </ul>
-              <div className="mt-3">
+              <div className="mt-3 flex gap-2">
                 <PrimaryButton onClick={() => doAction(ACTIONS.find(a => a.id === 'pay_debt'))} disabled={state.debt <= 0 || state.cash <= 0}>Pay Down Debt</PrimaryButton>
+                <GhostButton onClick={() => doAction(ACTIONS.find(a => a.id === 'negotiate_vendor'))}>Negotiate Vendors</GhostButton>
+                <GhostButton onClick={() => doAction(ACTIONS.find(a => a.id === 'refinance'))}>Refinance</GhostButton>
               </div>
             </div>
 
             <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
               <div className="flex items-center justify-between mb-3">
-                <h2 className="text-lg font-semibold">Upgrades Shop</h2>
+                <h2 className="text-lg font-semibold">Upgrades & Hires</h2>
                 <GhostButton onClick={() => setShopOpen((v) => !v)}>{shopOpen ? "Hide" : "Show"}</GhostButton>
               </div>
               <AnimatePresence initial={false}>
@@ -853,8 +907,9 @@ function GameInner() {
               <ul className="list-disc pl-5 text-sm text-neutral-300 space-y-1">
                 <li>Mix actions to avoid <em>fatigue</em> penalties in a single day.</li>
                 <li>Use REBILL offers for stable MRR, CPA/CPC for spikes.</li>
-                <li>Buy <em>Bookkeeper</em> to cut late fees; <em>Insurance</em> to soften breakdowns.</li>
-                <li>End your day to trigger passive income, bills, and events.</li>
+                <li>Negotiate vendors and refinance to manage burn.</li>
+                <li>Hire staff when cashflow covers payroll.</li>
+                <li>End of day triggers passive income, bills, events, interest, and quarterly taxes.</li>
               </ul>
             </div>
           </div>
@@ -882,11 +937,15 @@ function GameInner() {
             <em>fatigue</em> penalty.
           </p>
           <p>
-            NEW: <strong>Bills</strong> hit weekly and monthly. If you can't pay, the remainder (plus a late fee) becomes <strong>Debt</strong>.
-            Use <em>Pay Down Debt</em> to clear it. Random <strong>issues</strong> like equipment breakdowns and policy updates add realism.
+            Bills hit weekly/monthly; debt accrues <strong>variable interest (APR)</strong>. Quarterly taxes are 12% of revenue tracked in the quarter.
+            Negotiate vendors for temporary discounts and refinance to lower APR.
           </p>
           <p>
-            Use <strong>Save Slots</strong> to A/B test strategies. Space = Shop, Enter = End Day.
+            Hire staff from the shop (adds weekly payroll but boosts productivity). Space = Shop, Enter = End Day. Toggle <strong>Auto</strong> to
+            let days tick automatically.
+          </p>
+          <p>
+            Use <strong>Save Slots</strong> to A/B test strategies.
           </p>
         </div>
       </Modal>
